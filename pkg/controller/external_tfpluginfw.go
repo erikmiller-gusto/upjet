@@ -102,6 +102,7 @@ type terraformPluginFrameworkExternalClient struct {
 	server         tfprotov6.ProviderServer
 	params         map[string]any
 	planResponse   *tfprotov6.PlanResourceChangeResponse
+	plannedIdentity *tfprotov6.ResourceIdentityData
 	resourceSchema rschema.Schema
 	// the terraform value type associated with the resource schema
 	resourceValueTerraformType tftypes.Type
@@ -367,6 +368,7 @@ func (n *terraformPluginFrameworkExternalClient) getDiffPlanResponse(ctx context
 		PriorState:       n.opTracker.GetFrameworkTFState(),
 		Config:           &tfConfigDynamicVal,
 		ProposedNewState: &tfProposedStateDynamicVal,
+		PriorIdentity:    n.opTracker.GetFrameworkIdentity(),
 	}
 	planResponse, err := n.server.PlanResourceChange(ctx, prcReq)
 	if err != nil {
@@ -389,6 +391,7 @@ func (n *terraformPluginFrameworkExternalClient) getDiffPlanResponse(ctx context
 	if err := n.filterRequiresReplace(ctx, planResponse, tfStateValue, plannedStateValue); err != nil {
 		return nil, false, errors.Wrap(err, "failed to check for required replacement fields")
 	}
+	n.plannedIdentity = planResponse.PlannedIdentity
 
 	return planResponse, n.filteredDiffExists(rawDiff), nil
 }
@@ -477,8 +480,9 @@ func (n *terraformPluginFrameworkExternalClient) Observe(ctx context.Context, mg
 	}
 
 	readRequest := &tfprotov6.ReadResourceRequest{
-		TypeName:     n.config.Name,
-		CurrentState: n.opTracker.GetFrameworkTFState(),
+		TypeName:        n.config.Name,
+		CurrentState:    n.opTracker.GetFrameworkTFState(),
+		CurrentIdentity: n.opTracker.GetFrameworkIdentity(),
 	}
 	readResponse, err := n.server.ReadResource(ctx, readRequest)
 	if err != nil {
@@ -509,12 +513,14 @@ func (n *terraformPluginFrameworkExternalClient) Observe(ctx context.Context, mg
 			return managed.ExternalObservation{}, errors.Wrap(err, "cannot create nil dynamic value")
 		}
 		n.opTracker.SetFrameworkTFState(&nildynamicValue)
+		n.opTracker.SetFrameworkIdentity(nil)
 	} else {
 		tfStateValue, err = readResponse.NewState.Unmarshal(n.resourceValueTerraformType)
 		if err != nil {
 			return managed.ExternalObservation{}, errors.Wrap(err, "cannot unmarshal state value")
 		}
 		n.opTracker.SetFrameworkTFState(readResponse.NewState)
+		n.opTracker.SetFrameworkIdentity(readResponse.NewIdentity)
 	}
 
 	// Determine if the resource exists based on Terraform state
@@ -639,10 +645,11 @@ func (n *terraformPluginFrameworkExternalClient) Create(ctx context.Context, mg 
 	}
 
 	applyRequest := &tfprotov6.ApplyResourceChangeRequest{
-		TypeName:     n.config.Name,
-		PriorState:   n.opTracker.GetFrameworkTFState(),
-		PlannedState: n.planResponse.PlannedState,
-		Config:       &tfConfigDynamicVal,
+		TypeName:        n.config.Name,
+		PriorState:      n.opTracker.GetFrameworkTFState(),
+		PlannedState:    n.planResponse.PlannedState,
+		Config:          &tfConfigDynamicVal,
+		PlannedIdentity: n.plannedIdentity,
 	}
 	start := time.Now()
 	applyResponse, err := n.server.ApplyResourceChange(ctx, applyRequest)
@@ -658,6 +665,7 @@ func (n *terraformPluginFrameworkExternalClient) Create(ctx context.Context, mg 
 		// In the following reconciles, this helps to track the external
 		// resource, rather than try to recreate that might cause leaking.
 		n.opTracker.SetFrameworkTFState(applyResponse.NewState)
+		n.opTracker.SetFrameworkIdentity(applyResponse.NewIdentity)
 		return managed.ExternalCreation{}, errors.Wrap(fatalDiags, "resource creation call returned error diags")
 	}
 
@@ -678,6 +686,7 @@ func (n *terraformPluginFrameworkExternalClient) Create(ctx context.Context, mg 
 	}
 
 	n.opTracker.SetFrameworkTFState(applyResponse.NewState)
+	n.opTracker.SetFrameworkIdentity(applyResponse.NewIdentity)
 
 	if _, err := n.setExternalName(mg, stateValueMap); err != nil {
 		return managed.ExternalCreation{}, errors.Wrapf(err, "failed to set the external-name of the managed resource during create")
@@ -730,10 +739,11 @@ func (n *terraformPluginFrameworkExternalClient) Update(ctx context.Context, mg 
 	}
 
 	applyRequest := &tfprotov6.ApplyResourceChangeRequest{
-		TypeName:     n.config.Name,
-		PriorState:   n.opTracker.GetFrameworkTFState(),
-		PlannedState: n.planResponse.PlannedState,
-		Config:       &tfConfigDynamicVal,
+		TypeName:        n.config.Name,
+		PriorState:      n.opTracker.GetFrameworkTFState(),
+		PlannedState:    n.planResponse.PlannedState,
+		Config:          &tfConfigDynamicVal,
+		PlannedIdentity: n.plannedIdentity,
 	}
 	start := time.Now()
 	applyResponse, err := n.server.ApplyResourceChange(ctx, applyRequest)
@@ -745,6 +755,7 @@ func (n *terraformPluginFrameworkExternalClient) Update(ctx context.Context, mg 
 		return managed.ExternalUpdate{}, errors.Wrap(fatalDiags, "resource update call returned error diags")
 	}
 	n.opTracker.SetFrameworkTFState(applyResponse.NewState)
+	n.opTracker.SetFrameworkIdentity(applyResponse.NewIdentity)
 
 	newStateAfterApplyVal, err := applyResponse.NewState.Unmarshal(n.resourceValueTerraformType)
 	if err != nil {
@@ -788,10 +799,11 @@ func (n *terraformPluginFrameworkExternalClient) Delete(ctx context.Context, _ x
 	}
 
 	applyRequest := &tfprotov6.ApplyResourceChangeRequest{
-		TypeName:     n.config.Name,
-		PriorState:   n.opTracker.GetFrameworkTFState(),
-		PlannedState: &plannedState,
-		Config:       &tfConfigDynamicVal,
+		TypeName:        n.config.Name,
+		PriorState:      n.opTracker.GetFrameworkTFState(),
+		PlannedState:    &plannedState,
+		Config:          &tfConfigDynamicVal,
+		PlannedIdentity: n.plannedIdentity,
 	}
 	start := time.Now()
 	applyResponse, err := n.server.ApplyResourceChange(ctx, applyRequest)
@@ -803,6 +815,7 @@ func (n *terraformPluginFrameworkExternalClient) Delete(ctx context.Context, _ x
 		return managed.ExternalDelete{}, errors.Wrap(fatalDiags, "resource deletion call returned error diags")
 	}
 	n.opTracker.SetFrameworkTFState(applyResponse.NewState)
+	n.opTracker.SetFrameworkIdentity(applyResponse.NewIdentity)
 
 	newStateAfterApplyVal, err := applyResponse.NewState.Unmarshal(n.resourceValueTerraformType)
 	if err != nil {
