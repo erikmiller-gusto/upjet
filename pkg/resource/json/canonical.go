@@ -15,9 +15,9 @@ const (
 )
 
 var (
-	cJSON = jsoniter.Config{
+	cJSON = newLockedAPI(jsoniter.Config{
 		SortMapKeys: true,
-	}.Froze()
+	}.Froze())
 )
 
 // Canonicalize minifies and orders the keys of the specified JSON document
